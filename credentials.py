@@ -45,14 +45,26 @@ def get_sqlalchemy_engine():
 
     db_url = _get_secret("NEON_DB_URL")
 
+    # pg8000 is a pure-Python PostgreSQL driver — no system libpq needed.
+    # Strip all query params from URL and pass SSL via connect_args instead.
+    import ssl
+    import re
+    pg8000_url = db_url.replace("postgresql://", "postgresql+pg8000://")
+    # Remove all query string params (sslmode, channel_binding) — handled via connect_args
+    pg8000_url = re.sub(r'\?.*$', '', pg8000_url)
+
+    ssl_ctx = ssl.create_default_context()
+    ssl_ctx.check_hostname = False
+    ssl_ctx.verify_mode = ssl.CERT_NONE
+
     _engine = create_engine(
-        db_url,
+        pg8000_url,
         pool_pre_ping=True,
         pool_size=3,
         max_overflow=5,
         connect_args={
-            "sslmode": "require",
-            "connect_timeout": 10,
+            "ssl_context": ssl_ctx,
+            "timeout": 10,
         },
     )
     logger.info("SQLAlchemy engine initialised (Neon PostgreSQL)")
