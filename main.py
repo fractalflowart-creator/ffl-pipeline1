@@ -107,6 +107,58 @@ async def privacy_policy():
 """
 
 
+# ── TikTok OAuth Callback ───────────────────────────────────────────────────
+
+@app.get("/auth/tiktok/callback", response_class=HTMLResponse)
+async def tiktok_oauth_callback(request: Request):
+    """
+    TikTok OAuth 2.0 callback endpoint.
+    Receives the authorization code after the user authorises the app.
+    Displays the code for manual token exchange during initial setup.
+    """
+    code = request.query_params.get("code")
+    error = request.query_params.get("error")
+    state = request.query_params.get("state", "")
+
+    if error:
+        logger.warning(f"TikTok OAuth error: {error}")
+        return f"<h2>TikTok Auth Error</h2><p>{error}</p>"
+
+    if code:
+        logger.info(f"TikTok OAuth code received (state={state})")
+        return f"""
+        <!DOCTYPE html><html><head><title>TikTok Auth</title>
+        <style>body{{font-family:sans-serif;max-width:600px;margin:60px auto;padding:0 20px}}
+        code{{background:#f4f4f4;padding:8px 12px;display:block;word-break:break-all;border-radius:4px}}</style>
+        </head><body>
+        <h2>TikTok Authorisation Successful</h2>
+        <p>Copy the authorisation code below and provide it to the FFL agent swarm to complete token exchange:</p>
+        <code>{code}</code>
+        <p style="color:#888;font-size:0.9em">This code expires in 10 minutes. Do not share it.</p>
+        </body></html>
+        """
+
+    return "<h2>TikTok Auth</h2><p>No code received.</p>"
+
+
+# ── TikTok Webhook Handler ───────────────────────────────────────────────────
+
+@app.post("/webhooks/tiktok")
+async def tiktok_webhook(request: Request):
+    """
+    Handles TikTok webhook events (video status updates, comments, etc.).
+    Returns HTTP 200 immediately to acknowledge receipt.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    event_type = payload.get("event", "unknown")
+    logger.info(f"TikTok webhook received — event: {event_type}")
+    return JSONResponse(status_code=200, content={"status": "received", "event": event_type})
+
+
 # ── TikTok Site Verification ─────────────────────────────────────────────────
 
 @app.get("/tiktokCdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L.txt", response_class=PlainTextResponse)
