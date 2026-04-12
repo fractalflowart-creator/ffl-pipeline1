@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from sqlalchemy import text
 
 from credentials import get_sqlalchemy_engine, get_shopify_webhook_secret, get_etsy_shared_secret
@@ -37,6 +37,73 @@ app = FastAPI(
     description="Shopify & Etsy order webhooks → Neon PostgreSQL",
     version="1.0.0",
 )
+
+
+# ── Legal Pages ──────────────────────────────────────────────────────────────
+
+@app.get("/terms", response_class=HTMLResponse)
+async def terms_of_service():
+    """Terms of Service for FFL Swarm Integrator."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Terms of Service — FFL Swarm Integrator</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}h1{font-size:1.6em}h2{font-size:1.2em;margin-top:2em}p{margin:0.8em 0}</style>
+</head>
+<body>
+<h1>Terms of Service — FFL Swarm Integrator</h1>
+<p><strong>Last updated: 12 April 2026</strong></p>
+<p>FFL Swarm Integrator ("the App") is a private automation tool operated by Fractal Flow Lab (ABN pending), an individual creator business based in Australia. The App integrates with TikTok's developer platform to schedule and publish content and retrieve analytics for the <strong>fractalflowlab_</strong> TikTok account.</p>
+<h2>1. Scope of Use</h2>
+<p>The App is used exclusively by the account owner of Fractal Flow Lab. It is not a public-facing application and does not provide services to third-party users. No other individuals or organisations are authorised to use the App.</p>
+<h2>2. TikTok API Usage</h2>
+<p>The App uses TikTok's Content Posting API and Display API solely to publish fractal art content and retrieve performance metrics for the fractalflowlab_ account. All API usage complies with TikTok's Platform Terms of Service and Developer Policies.</p>
+<h2>3. Data Handling</h2>
+<p>All data retrieved from TikTok (including post metrics and account information) is stored privately in a secured database operated by Fractal Flow Lab. No TikTok user data is shared with, sold to, or accessible by any third party.</p>
+<h2>4. Limitation of Liability</h2>
+<p>The App is provided as-is for internal operational use. Fractal Flow Lab accepts no liability for service interruptions, data loss, or API changes made by TikTok.</p>
+<h2>5. Contact</h2>
+<p>For any questions regarding these terms, contact: <a href="mailto:Fractalflowart@gmail.com">Fractalflowart@gmail.com</a></p>
+</body></html>
+"""
+
+
+@app.get("/privacy", response_class=HTMLResponse)
+async def privacy_policy():
+    """Privacy Policy for FFL Swarm Integrator."""
+    return """
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Privacy Policy — FFL Swarm Integrator</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:40px auto;padding:0 20px;line-height:1.6;color:#222}h1{font-size:1.6em}h2{font-size:1.2em;margin-top:2em}p{margin:0.8em 0}</style>
+</head>
+<body>
+<h1>Privacy Policy — FFL Swarm Integrator</h1>
+<p><strong>Last updated: 12 April 2026</strong></p>
+<p>This Privacy Policy describes how Fractal Flow Lab ("we", "us") collects, uses, and protects information in connection with the FFL Swarm Integrator application.</p>
+<h2>1. Information We Collect</h2>
+<p>The App accesses the following data from TikTok via the official TikTok API, solely for the fractalflowlab_ account:</p>
+<ul>
+<li>Basic account information (username, follower count, profile details)</li>
+<li>Post performance metrics (views, likes, shares, comments, engagement rate)</li>
+<li>Content upload and scheduling data</li>
+</ul>
+<h2>2. How We Use Information</h2>
+<p>All data collected is used exclusively for internal analytics and content scheduling by the account owner. We do not use TikTok data for advertising, profiling, or any commercial purpose beyond managing the fractalflowlab_ account.</p>
+<h2>3. Data Storage</h2>
+<p>Performance metrics are stored in a private, encrypted PostgreSQL database (Neon.tech, hosted on AWS ap-southeast-2, Sydney, Australia). No TikTok user data from third parties is stored.</p>
+<h2>4. Data Sharing</h2>
+<p>We do not sell, share, rent, or disclose any data to third parties. The App is strictly private and single-user.</p>
+<h2>5. Data Retention</h2>
+<p>Analytics data is retained for up to 24 months for business performance tracking and then deleted.</p>
+<h2>6. Your Rights</h2>
+<p>As this App is single-user and operated by the account owner, all data is under the direct control of the operator. For any privacy enquiries, contact: <a href="mailto:Fractalflowart@gmail.com">Fractalflowart@gmail.com</a></p>
+<h2>7. Changes to This Policy</h2>
+<p>We may update this Privacy Policy from time to time. The latest version will always be available at this URL.</p>
+</body></html>
+"""
 
 
 # ── Health check ──────────────────────────────────────────────────────────────
