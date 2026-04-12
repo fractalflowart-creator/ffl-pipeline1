@@ -19,7 +19,8 @@ from datetime import datetime, timezone
 from typing import Any, Dict
 
 from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from credentials import get_sqlalchemy_engine, get_shopify_webhook_secret, get_etsy_shared_secret
@@ -108,7 +109,7 @@ async def privacy_policy():
 
 # ── TikTok Site Verification ─────────────────────────────────────────────────
 
-@app.get("/tiktok-developers-site-verification=CdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L", response_class=HTMLResponse)
+@app.get("/tiktokCdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L.txt", response_class=PlainTextResponse)
 async def tiktok_verification():
     """TikTok developer site verification file."""
     return "tiktok-developers-site-verification=CdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L"
