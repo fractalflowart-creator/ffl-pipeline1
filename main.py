@@ -106,6 +106,14 @@ async def privacy_policy():
 """
 
 
+# ── TikTok Site Verification ─────────────────────────────────────────────────
+
+@app.get("/tiktok-developers-site-verification=CdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L", response_class=HTMLResponse)
+async def tiktok_verification():
+    """TikTok developer site verification file."""
+    return "tiktok-developers-site-verification=CdYKnoArSY5rB4oLeckQEFPOfEn8Zc6L"
+
+
 # ── Health check ──────────────────────────────────────────────────────────────
 
 @app.get("/health")
