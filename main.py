@@ -9,8 +9,8 @@ Endpoints:
   POST /webhooks/shopify/orders/create   — Shopify new order
   POST /webhooks/etsy/orders/create      — Etsy new order (receipt)
   GET  /health                           — Health check
-  POST /internal/hook_library            — Agent 2: write trend row to hook_library table
-  POST /internal/trend_shift             — Agent 7: write Vibe-Shift Brief to trend_shift_logs table
+  POST /internal/hook_library            — Agent 2: write trend row to agent2_trend_research table
+  POST /internal/trend_shift             — Agent 7: write Vibe-Shift Brief to agent7_vibe_shift_briefs table
 """
 
 import hashlib
@@ -481,7 +481,7 @@ async def write_hook_library(
     authorization: str = Header(None),
 ):
     """
-    Internal endpoint: Agent 2 (Growth Hacker) writes a trend row to hook_library.
+    Internal endpoint: Agent 2 (Growth Hacker) writes a trend row to agent2_trend_research.
     Requires Bearer token matching PIPELINE_INTERNAL_KEY.
 
     Expected JSON body:
@@ -513,9 +513,9 @@ async def write_hook_library(
     engine = get_sqlalchemy_engine()
     try:
         with engine.begin() as conn:
-            # Ensure hook_library table exists
+            # Ensure agent2_trend_research table exists
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS hook_library (
+                CREATE TABLE IF NOT EXISTS agent2_trend_research (
                     id SERIAL PRIMARY KEY,
                     keyword TEXT NOT NULL,
                     urgency_flag TEXT NOT NULL CHECK (urgency_flag IN ('HOT', 'MONITOR', 'WATCH')),
@@ -530,7 +530,7 @@ async def write_hook_library(
             """))
             result = conn.execute(
                 text("""
-                    INSERT INTO hook_library
+                    INSERT INTO agent2_trend_research
                     (keyword, urgency_flag, trend_score, source, region, vibe_shift_brief, cycle_date, raw_data)
                     VALUES (:keyword, :urgency_flag, :trend_score, :source, :region, :vibe_shift_brief, :cycle_date, :raw_data)
                     RETURNING id
@@ -548,10 +548,10 @@ async def write_hook_library(
             )
             row = result.fetchone()
             new_id = row[0]
-            logger.info(f"hook_library write OK — id={new_id}, keyword={body['keyword']}, flag={body['urgency_flag']}")
+            logger.info(f"agent2_trend_research write OK — id={new_id}, keyword={body['keyword']}, flag={body['urgency_flag']}")
             return {"status": "ok", "id": new_id, "keyword": body["keyword"], "urgency_flag": body["urgency_flag"]}
     except Exception as e:
-        logger.error(f"hook_library write failed: {e}")
+        logger.error(f"agent2_trend_research write failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
 
 
@@ -561,7 +561,7 @@ async def write_trend_shift(
     authorization: str = Header(None),
 ):
     """
-    Internal endpoint: Agent 7 (Seasonal Pivot) writes a Vibe-Shift Brief to trend_shift_logs.
+    Internal endpoint: Agent 7 (Seasonal Pivot) writes a Vibe-Shift Brief to agent7_vibe_shift_briefs.
     Requires Bearer token matching PIPELINE_INTERNAL_KEY.
 
     Expected JSON body:
@@ -592,9 +592,9 @@ async def write_trend_shift(
     engine = get_sqlalchemy_engine()
     try:
         with engine.begin() as conn:
-            # Ensure trend_shift_logs table exists
+            # Ensure agent7_vibe_shift_briefs table exists
             conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS trend_shift_logs (
+                CREATE TABLE IF NOT EXISTS agent7_vibe_shift_briefs (
                     id SERIAL PRIMARY KEY,
                     brief_id TEXT NOT NULL UNIQUE,
                     title TEXT NOT NULL,
@@ -608,7 +608,7 @@ async def write_trend_shift(
             """))
             result = conn.execute(
                 text("""
-                    INSERT INTO trend_shift_logs
+                    INSERT INTO agent7_vibe_shift_briefs
                     (brief_id, title, summary, macro_signals, activation_date, status, source_agent)
                     VALUES (:brief_id, :title, :summary, :macro_signals, :activation_date, :status, :source_agent)
                     ON CONFLICT (brief_id) DO UPDATE SET
@@ -631,10 +631,10 @@ async def write_trend_shift(
             )
             row = result.fetchone()
             new_id = row[0]
-            logger.info(f"trend_shift_logs write OK — id={new_id}, brief_id={body['brief_id']}, status={body['status']}")
+            logger.info(f"agent7_vibe_shift_briefs write OK — id={new_id}, brief_id={body['brief_id']}, status={body['status']}")
             return {"status": "ok", "id": new_id, "brief_id": body["brief_id"], "title": body["title"]}
     except Exception as e:
-        logger.error(f"trend_shift_logs write failed: {e}")
+        logger.error(f"agent7_vibe_shift_briefs write failed: {e}")
         raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
 
 
