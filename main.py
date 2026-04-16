@@ -1,13 +1,16 @@
 """
-FFL Pipeline 1 — Webhook Receiver
+FFL Pipeline 1 — Webhook Receiver + Agent Data Writer
 Accepts order webhooks from Shopify and Etsy.
 Writes directly to Neon PostgreSQL (orders + inventory_logs tables).
 Triggers Printful fulfillment AFTER successful Neon write.
+Also provides internal endpoints for agent swarm to write trend/research data to Neon.
 
 Endpoints:
   POST /webhooks/shopify/orders/create   — Shopify new order
   POST /webhooks/etsy/orders/create      — Etsy new order (receipt)
   GET  /health                           — Health check
+  POST /internal/hook_library            — Agent 2: write trend row to hook_library table
+  POST /internal/trend_shift             — Agent 7: write Vibe-Shift Brief to trend_shift_logs table
 """
 
 import hashlib
@@ -36,7 +39,7 @@ logger = logging.getLogger("ffl.pipeline1")
 app = FastAPI(
     title="FFL Pipeline 1 — Webhook Receiver",
     description="Shopify & Etsy order webhooks → Neon PostgreSQL",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 
@@ -447,6 +450,192 @@ async def etsy_order_created(
         "external_order_id": external_order_id,
         "neon_order_id": order_id,
     }
+
+
+# ── Internal Agent Write Endpoints ──────────────────────────────────────────
+
+def _get_pipeline_internal_key() -> str:
+    """Retrieve the internal pipeline authentication key from Secret Manager."""
+    from credentials import _get_secret
+    return _get_secret("PIPELINE_INTERNAL_KEY")
+
+
+def _verify_internal_key(authorization: str | None) -> bool:
+    """Verify the Bearer token matches PIPELINE_INTERNAL_KEY."""
+    if not authorization:
+        return False
+    try:
+        scheme, token = authorization.split(" ", 1)
+        if scheme.lower() != "bearer":
+            return False
+        expected = _get_pipeline_internal_key()
+        return hmac.compare_digest(token.strip(), expected.strip())
+    except Exception as e:
+        logger.error(f"Internal key verification error: {e}")
+        return False
+
+
+@app.post("/internal/hook_library")
+async def write_hook_library(
+    request: Request,
+    authorization: str = Header(None),
+):
+    """
+    Internal endpoint: Agent 2 (Growth Hacker) writes a trend row to hook_library.
+    Requires Bearer token matching PIPELINE_INTERNAL_KEY.
+
+    Expected JSON body:
+    {
+        "keyword": str,
+        "urgency_flag": str,           # "HOT", "MONITOR", or "WATCH"
+        "trend_score": float,           # 0.0–100.0
+        "source": str,                  # e.g. "pytrends", "google_cse"
+        "region": str,                  # e.g. "AU", "US", "GB"
+        "vibe_shift_brief": str,        # free text summary
+        "cycle_date": str,              # ISO date string e.g. "2026-04-16"
+        "raw_data": str                 # JSON string of raw source data
+    }
+    """
+    if not _verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/hook_library request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    required_fields = ["keyword", "urgency_flag", "source", "region", "cycle_date"]
+    for field in required_fields:
+        if field not in body:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+
+    engine = get_sqlalchemy_engine()
+    try:
+        with engine.begin() as conn:
+            # Ensure hook_library table exists
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS hook_library (
+                    id SERIAL PRIMARY KEY,
+                    keyword TEXT NOT NULL,
+                    urgency_flag TEXT NOT NULL CHECK (urgency_flag IN ('HOT', 'MONITOR', 'WATCH')),
+                    trend_score FLOAT DEFAULT 0.0,
+                    source TEXT NOT NULL,
+                    region TEXT NOT NULL,
+                    vibe_shift_brief TEXT,
+                    cycle_date DATE NOT NULL,
+                    raw_data TEXT,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            result = conn.execute(
+                text("""
+                    INSERT INTO hook_library
+                    (keyword, urgency_flag, trend_score, source, region, vibe_shift_brief, cycle_date, raw_data)
+                    VALUES (:keyword, :urgency_flag, :trend_score, :source, :region, :vibe_shift_brief, :cycle_date, :raw_data)
+                    RETURNING id
+                """),
+                {
+                    "keyword": body["keyword"],
+                    "urgency_flag": body["urgency_flag"],
+                    "trend_score": float(body.get("trend_score", 0.0)),
+                    "source": body["source"],
+                    "region": body["region"],
+                    "vibe_shift_brief": body.get("vibe_shift_brief", ""),
+                    "cycle_date": body["cycle_date"],
+                    "raw_data": body.get("raw_data", ""),
+                },
+            )
+            row = result.fetchone()
+            new_id = row[0]
+            logger.info(f"hook_library write OK — id={new_id}, keyword={body['keyword']}, flag={body['urgency_flag']}")
+            return {"status": "ok", "id": new_id, "keyword": body["keyword"], "urgency_flag": body["urgency_flag"]}
+    except Exception as e:
+        logger.error(f"hook_library write failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
+
+
+@app.post("/internal/trend_shift")
+async def write_trend_shift(
+    request: Request,
+    authorization: str = Header(None),
+):
+    """
+    Internal endpoint: Agent 7 (Seasonal Pivot) writes a Vibe-Shift Brief to trend_shift_logs.
+    Requires Bearer token matching PIPELINE_INTERNAL_KEY.
+
+    Expected JSON body:
+    {
+        "brief_id": str,                # e.g. "VBS-005"
+        "title": str,                   # e.g. "Quiet Mineral Biophilia"
+        "summary": str,                 # full brief text
+        "macro_signals": str,           # JSON string of macro signals list
+        "activation_date": str,         # ISO date string e.g. "2026-04-16"
+        "status": str,                  # "PENDING_OWNER_APPROVAL", "APPROVED", "REJECTED"
+        "source_agent": str             # e.g. "Agent 7"
+    }
+    """
+    if not _verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/trend_shift request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    required_fields = ["brief_id", "title", "summary", "activation_date", "status"]
+    for field in required_fields:
+        if field not in body:
+            raise HTTPException(status_code=400, detail=f"Missing required field: {field}")
+
+    engine = get_sqlalchemy_engine()
+    try:
+        with engine.begin() as conn:
+            # Ensure trend_shift_logs table exists
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS trend_shift_logs (
+                    id SERIAL PRIMARY KEY,
+                    brief_id TEXT NOT NULL UNIQUE,
+                    title TEXT NOT NULL,
+                    summary TEXT,
+                    macro_signals TEXT,
+                    activation_date DATE NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING_OWNER_APPROVAL',
+                    source_agent TEXT DEFAULT 'Agent 7',
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """))
+            result = conn.execute(
+                text("""
+                    INSERT INTO trend_shift_logs
+                    (brief_id, title, summary, macro_signals, activation_date, status, source_agent)
+                    VALUES (:brief_id, :title, :summary, :macro_signals, :activation_date, :status, :source_agent)
+                    ON CONFLICT (brief_id) DO UPDATE SET
+                        title = EXCLUDED.title,
+                        summary = EXCLUDED.summary,
+                        macro_signals = EXCLUDED.macro_signals,
+                        status = EXCLUDED.status,
+                        created_at = NOW()
+                    RETURNING id
+                """),
+                {
+                    "brief_id": body["brief_id"],
+                    "title": body["title"],
+                    "summary": body["summary"],
+                    "macro_signals": body.get("macro_signals", ""),
+                    "activation_date": body["activation_date"],
+                    "status": body["status"],
+                    "source_agent": body.get("source_agent", "Agent 7"),
+                },
+            )
+            row = result.fetchone()
+            new_id = row[0]
+            logger.info(f"trend_shift_logs write OK — id={new_id}, brief_id={body['brief_id']}, status={body['status']}")
+            return {"status": "ok", "id": new_id, "brief_id": body["brief_id"], "title": body["title"]}
+    except Exception as e:
+        logger.error(f"trend_shift_logs write failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
 
 
 # ── Startup ───────────────────────────────────────────────────────────────────
