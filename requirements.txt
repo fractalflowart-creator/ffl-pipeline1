@@ -6,3 +6,5 @@ python-dotenv==1.0.1
 pytrends==4.9.2
 google-api-python-client==2.131.0
 google-auth==2.29.0
+PyJWT==2.8.0
+cryptography==42.0.8
