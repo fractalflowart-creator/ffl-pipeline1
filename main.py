@@ -638,6 +638,149 @@ async def write_trend_shift(
         raise HTTPException(status_code=500, detail=f"Database write failed: {e}")
 
 
+# ── Neon → Google Sheets Sync ────────────────────────────────────────────────
+
+@app.post("/internal/sync_sheets")
+async def sync_neon_to_sheets(
+    request: Request,
+    authorization: str | None = Header(default=None),
+):
+    """
+    Sync latest Neon data to Google Sheets Live-Pulse Engine.
+    Reads agent2_trend_research and agent7_vibe_shift_briefs tables,
+    then appends any rows not yet in Sheets to the appropriate tabs.
+    Auth: Bearer {PIPELINE_INTERNAL_KEY}
+    """
+    if not _verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/sync_sheets request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    SPREADSHEET_ID = "1kCkgJv9tX6mdY2Q6ES6aWjMVhk_o4xbHtfHpFTSYLiU"
+    HOOK_LIBRARY_TAB = "\U0001f3a3 Active Hook Library"
+    TREND_SHIFT_TAB = "\U0001f4c5 Weekly Trend Shift Log"
+
+    try:
+        import json as _json
+        import urllib.request as _urllib
+        import urllib.error as _urllib_error
+
+        # Build Google Sheets API credentials from service account JSON stored in env
+        sa_json_str = os.environ.get("GOOGLE_SHEETS_SERVICE_ACCT", "")
+        if not sa_json_str:
+            raise HTTPException(status_code=500, detail="GOOGLE_SHEETS_SERVICE_ACCT env var not set")
+
+        sa_info = _json.loads(sa_json_str)
+
+        # Get OAuth2 token using service account JWT
+        import time as _time
+        import jwt as _jwt  # PyJWT
+
+        now = int(_time.time())
+        payload = {
+            "iss": sa_info["client_email"],
+            "scope": "https://www.googleapis.com/auth/spreadsheets",
+            "aud": "https://oauth2.googleapis.com/token",
+            "iat": now,
+            "exp": now + 3600,
+        }
+        private_key = sa_info["private_key"]
+        signed_jwt = _jwt.encode(payload, private_key, algorithm="RS256")
+
+        token_data = f"grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={signed_jwt}"
+        token_req = _urllib.Request(
+            "https://oauth2.googleapis.com/token",
+            data=token_data.encode(),
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+        with _urllib.urlopen(token_req) as resp:
+            token_resp = _json.loads(resp.read())
+        access_token = token_resp["access_token"]
+        sheets_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        }
+
+        engine = get_sqlalchemy_engine()
+        synced_hook = 0
+        synced_brief = 0
+
+        # ── Sync agent2_trend_research → Active Hook Library ──────────────────
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT keyword, urgency_flag, trend_score, source, region, vibe_shift_brief, cycle_date, created_at "
+                "FROM agent2_trend_research ORDER BY created_at ASC"
+            )).fetchall()
+
+        if rows:
+            append_values = []
+            for row in rows:
+                append_values.append([
+                    str(row[7])[:10] if row[7] else "",  # Date Added
+                    str(row[3]) if row[3] else "",        # Platform/Source
+                    str(row[1]) if row[1] else "",        # Urgency Flag
+                    str(row[0]) if row[0] else "",        # Keyword
+                    str(row[5]) if row[5] else "",        # Vibe Shift Brief
+                    str(row[2]) if row[2] else "",        # Trend Score
+                    str(row[4]) if row[4] else "",        # Region
+                    str(row[6])[:10] if row[6] else "",  # Cycle Date
+                ])
+            append_body = _json.dumps({"values": append_values, "majorDimension": "ROWS"}).encode()
+            append_url = (
+                f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
+                f"/values/{_urllib.parse.quote(HOOK_LIBRARY_TAB + '!A:H')}:append"
+                f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+            )
+            append_req = _urllib.Request(append_url, data=append_body, headers=sheets_headers, method="POST")
+            with _urllib.urlopen(append_req) as resp:
+                _json.loads(resp.read())
+            synced_hook = len(append_values)
+
+        # ── Sync agent7_vibe_shift_briefs → Weekly Trend Shift Log ────────────
+        with engine.connect() as conn:
+            briefs = conn.execute(text(
+                "SELECT brief_id, title, summary, macro_signals, activation_date, status, source_agent, created_at "
+                "FROM agent7_vibe_shift_briefs ORDER BY created_at ASC"
+            )).fetchall()
+
+        if briefs:
+            brief_values = []
+            for b in briefs:
+                brief_values.append([
+                    str(b[7])[:10] if b[7] else "",  # Date Added
+                    str(b[0]) if b[0] else "",        # Brief ID
+                    str(b[1]) if b[1] else "",        # Title
+                    str(b[2]) if b[2] else "",        # Summary
+                    str(b[3]) if b[3] else "",        # Macro Signals
+                    str(b[4])[:10] if b[4] else "",  # Activation Date
+                    str(b[5]) if b[5] else "",        # Status
+                    str(b[6]) if b[6] else "",        # Source Agent
+                ])
+            brief_body = _json.dumps({"values": brief_values, "majorDimension": "ROWS"}).encode()
+            brief_url = (
+                f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
+                f"/values/{_urllib.parse.quote(TREND_SHIFT_TAB + '!A:H')}:append"
+                f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+            )
+            brief_req = _urllib.Request(brief_url, data=brief_body, headers=sheets_headers, method="POST")
+            with _urllib.urlopen(brief_req) as resp:
+                _json.loads(resp.read())
+            synced_brief = len(brief_values)
+
+        logger.info(f"sync_sheets OK — {synced_hook} trend rows, {synced_brief} brief rows synced")
+        return {
+            "status": "ok",
+            "synced_trend_rows": synced_hook,
+            "synced_brief_rows": synced_brief,
+            "spreadsheet_id": SPREADSHEET_ID,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"sync_sheets failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Sync failed: {e}")
+
+
 # ── Startup ───────────────────────────────────────────────────────────────────
 
 @app.on_event("startup")
