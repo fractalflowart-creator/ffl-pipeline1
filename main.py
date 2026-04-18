@@ -662,6 +662,7 @@ async def sync_neon_to_sheets(
     try:
         import json as _json
         import urllib.request as _urllib
+        import urllib.parse as _urllib_parse
         import urllib.error as _urllib_error
 
         # Build Google Sheets API credentials from service account JSON stored in env
@@ -727,7 +728,7 @@ async def sync_neon_to_sheets(
             append_body = _json.dumps({"values": append_values, "majorDimension": "ROWS"}).encode()
             append_url = (
                 f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
-                f"/values/{_urllib.parse.quote(HOOK_LIBRARY_TAB + '!A:H')}:append"
+                f"/values/{_urllib_parse.quote(HOOK_LIBRARY_TAB + '!A:H')}:append"
                 f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
             )
             append_req = _urllib.Request(append_url, data=append_body, headers=sheets_headers, method="POST")
@@ -758,7 +759,7 @@ async def sync_neon_to_sheets(
             brief_body = _json.dumps({"values": brief_values, "majorDimension": "ROWS"}).encode()
             brief_url = (
                 f"https://sheets.googleapis.com/v4/spreadsheets/{SPREADSHEET_ID}"
-                f"/values/{_urllib.parse.quote(TREND_SHIFT_TAB + '!A:H')}:append"
+                f"/values/{_urllib_parse.quote(TREND_SHIFT_TAB + '!A:H')}:append"
                 f"?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
             )
             brief_req = _urllib.Request(brief_url, data=brief_body, headers=sheets_headers, method="POST")
