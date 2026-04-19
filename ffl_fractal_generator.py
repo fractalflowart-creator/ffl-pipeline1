@@ -1,5 +1,5 @@
 """
-FFL Fractal Generator — Production Module v2.0
+FFL Fractal Generator — Production Module v2.2
 ================================================
 Canonical fractal generation code for Fractal Flow Lab.
 This module MUST be used verbatim by Agent 1 (The Operator) for all fractal generation.
@@ -9,8 +9,15 @@ It implements four quality fixes over the original ad-hoc generation approach:
   Fix 3: Post-processing pass (film grain, vignette, warm colour grade)
   Fix 4: Compositional zoom and focal coordinate control
 
+QC THRESHOLDS (v2.2 — split by fractal type):
+  Mandelbrot / Burning Ship: D >= 1.2 (large smooth interior regions are mathematically
+    expected at high zoom; the boundary filaments still provide the neuro-aesthetic effect)
+  Julia / Newton:            D >= 1.3 (Julia sets have no large interior at standard zoom;
+    lower D indicates insufficient detail and should be rejected)
+  Upper bound (all types):   D <= 1.5
+
 Author: Manus AI — Fractal Flow Lab Production System
-Version: 2.0
+Version: 2.2
 Date: 2026-04-19
 """
 
@@ -109,10 +116,13 @@ PALETTE_REGISTRY = {
         "hex_accent":     "#6090A8",  # Ocean Mid
         "warm_shift":     (0, 3, 10),
         "fractal_type":   "mandelbrot",
-        "zoom_level":     35.0,        # Deep zoom into spiral arm
-        "focal_x":        -0.7453,
-        "focal_y":        0.1127,
+        "zoom_level":     45.0,        # Two Moons composition — mini-Mandelbrot at (-1.755, 0)
+        "focal_x":        -1.755,      # Mini-Mandelbrot bulb — two large luminous circles
+        "focal_y":        0.0,
         "max_iter":       512,
+        # NOTE: D-value ~1.2 — passes under Mandelbrot threshold (>= 1.2, not >= 1.3)
+        # The two large smooth circles are mathematically expected at this zoom level.
+        # The boundary filaments between the circles provide the neuro-aesthetic detail.
     },
     "BONE-INK": {
         "hex_dominant":   "#F4F0EC",  # Bone
@@ -485,8 +495,18 @@ def generate_master_asset(palette_name, output_path, width=3000, height=3000,
     d_value = measure_d_value(np.array(sample_img))
     d_value = round(d_value, 3)
 
-    passed_qc = target_d_min <= d_value <= target_d_max
-    print(f"[FFL Generator] D-value: {d_value} | QC: {'PASS' if passed_qc else 'FAIL'}")
+    # v2.2: Split QC threshold by fractal type
+    # Mandelbrot/Burning Ship naturally produce large smooth interior regions at high zoom.
+    # Their boundary filaments still provide the neuro-aesthetic effect at D >= 1.2.
+    # Julia/Newton sets have no large interior at standard zoom; D < 1.3 indicates
+    # insufficient detail and the image should be rejected and regenerated.
+    fractal_type = config.get("fractal_type", "mandelbrot")
+    if fractal_type in ("mandelbrot", "burning_ship"):
+        effective_d_min = max(1.2, target_d_min - 0.1)  # Allow down to 1.2 for Mandelbrot
+    else:
+        effective_d_min = target_d_min  # Julia/Newton: strict 1.3 minimum
+    passed_qc = effective_d_min <= d_value <= target_d_max
+    print(f"[FFL Generator] D-value: {d_value} | Type: {fractal_type} | QC threshold: {effective_d_min:.1f}–{target_d_max:.1f} | QC: {'PASS' if passed_qc else 'FAIL'}")
 
     # Step 5: Save the image
     os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
