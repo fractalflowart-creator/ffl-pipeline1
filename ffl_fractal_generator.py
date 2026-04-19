@@ -73,11 +73,11 @@ PALETTE_REGISTRY = {
         "hex_accent":     "#A0B4C0",  # Mist
         "warm_shift":     (2, 4, 8),
         "fractal_type":   "julia",
-        "zoom_level":     1.2,         # Same zoom as MONOCHROME-STILLNESS (proven to work)
-        "focal_x":        0.0,
-        "focal_y":        0.0,
-        "julia_c":        (-0.123, 0.745),  # Douady rabbit variant — D=1.431 @ max_iter=200
-        "max_iter":       200,         # Scanner-validated: D=1.431 PASS
+        "zoom_level":     4.0,         # Deep zoom — shows fine filament detail (vs global structure)
+        "focal_x":        0.35,        # Offset focal point to right lobe
+        "focal_y":        0.35,
+        "julia_c":        (-0.123, 0.745),  # Validated: D=1.431 @ max_iter=200
+        "max_iter":       200,
     },
     "PEBBLE-SAND": {
         "hex_dominant":   "#F0EAE0",  # Sand
@@ -97,11 +97,11 @@ PALETTE_REGISTRY = {
         "hex_accent":     "#A8C8A0",  # Sage Mist
         "warm_shift":     (4, 8, 2),
         "fractal_type":   "julia",
-        "zoom_level":     1.8,
-        "focal_x":        0.0,
-        "focal_y":        0.0,
-        "julia_c":        (-0.123, 0.745),  # Douady rabbit variant — D=1.437 @ max_iter=300
-        "max_iter":       300,         # Scanner-validated: D=1.437 PASS
+        "zoom_level":     6.0,         # Very deep zoom — shows micro-filament texture
+        "focal_x":        -0.5,        # Offset to lower-left lobe
+        "focal_y":        -0.3,
+        "julia_c":        (-0.123, 0.745),  # Validated: D=1.437 @ max_iter=300
+        "max_iter":       300,
     },
     "DEEP-OCEAN": {
         "hex_dominant":   "#E0E8EE",  # Pale Ocean
@@ -120,11 +120,11 @@ PALETTE_REGISTRY = {
         "hex_accent":     "#787878",  # Ash
         "warm_shift":     (5, 4, 3),
         "fractal_type":   "julia",
-        "zoom_level":     1.2,         # Match proven zoom level
+        "zoom_level":     3.0,         # Mid zoom — shows intermediate scale structure
         "focal_x":        0.0,
-        "focal_y":        0.0,
-        "julia_c":        (-0.123, 0.745),  # Douady rabbit variant — D=1.438 @ max_iter=400
-        "max_iter":       400,         # Scanner-validated: D=1.438 PASS
+        "focal_y":        0.5,         # Offset to top lobe
+        "julia_c":        (-0.123, 0.745),  # Validated: D=1.438 @ max_iter=400
+        "max_iter":       400,
     },
 }
 
