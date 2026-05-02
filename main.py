@@ -27,6 +27,13 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 
 from credentials import get_sqlalchemy_engine, get_shopify_webhook_secret, get_etsy_shared_secret
+from taske_runtime_controls import (
+    router as taske_router,
+    build_shopify_order_record,
+    build_etsy_order_record,
+    create_finance_locked_order,
+    write_inventory_log_record,
+)
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -41,6 +48,7 @@ app = FastAPI(
     description="Shopify & Etsy order webhooks → Neon PostgreSQL",
     version="1.1.0",
 )
+app.include_router(taske_router)
 
 
 # ── Legal Pages ──────────────────────────────────────────────────────────────
@@ -221,39 +229,13 @@ def _verify_etsy_signature(raw_body: bytes, signature_header: str) -> bool:
 
 # ── Neon Write Helpers ────────────────────────────────────────────────────────
 
-def _write_order_to_neon(
-    external_order_id: str,
-    platform: str,
-    customer_email: str,
-    total_amount: float,
-    ordered_at: datetime,
-) -> int:
+def _write_order_to_neon(order_record) -> int:
     """
-    INSERT a new order into the Neon orders table.
+    INSERT a finance-locked order into the Neon orders table.
     Returns the new order_id (SERIAL primary key).
     Raises on duplicate external_order_id (UNIQUE constraint).
     """
-    engine = get_sqlalchemy_engine()
-    with engine.begin() as conn:
-        result = conn.execute(
-            text(
-                "INSERT INTO orders "
-                "(external_order_id, platform, customer_email, total_amount, status, ordered_at) "
-                "VALUES (:external_order_id, :platform, :customer_email, :total_amount, 'pending', :ordered_at) "
-                "RETURNING order_id"
-            ),
-            {
-                "external_order_id": external_order_id,
-                "platform": platform,
-                "customer_email": customer_email,
-                "total_amount": total_amount,
-                "ordered_at": ordered_at,
-            },
-        )
-        row = result.fetchone()
-        order_id = row[0]
-        logger.info(f"Neon write OK — orders.order_id={order_id} ({platform} #{external_order_id})")
-        return order_id
+    return create_finance_locked_order(order_record)
 
 
 def _write_inventory_log(
@@ -263,22 +245,12 @@ def _write_inventory_log(
     fulfillment_status: str,
 ) -> None:
     """INSERT a row into inventory_logs after fulfillment confirmation."""
-    engine = get_sqlalchemy_engine()
-    with engine.begin() as conn:
-        conn.execute(
-            text(
-                "INSERT INTO inventory_logs "
-                "(order_id, product_id, printful_order_id, fulfillment_status) "
-                "VALUES (:order_id, :product_id, :printful_order_id, :fulfillment_status)"
-            ),
-            {
-                "order_id": order_id,
-                "product_id": product_id,
-                "printful_order_id": printful_order_id,
-                "fulfillment_status": fulfillment_status,
-            },
-        )
-        logger.info(f"Neon write OK — inventory_logs for order_id={order_id}")
+    write_inventory_log_record(
+        order_id=order_id,
+        product_id=product_id,
+        printful_order_id=printful_order_id,
+        fulfillment_status=fulfillment_status,
+    )
 
 
 # ── Shopify Webhook Handler ───────────────────────────────────────────────────
@@ -309,30 +281,16 @@ async def shopify_order_created(
     # 2. Parse payload
     payload: Dict[str, Any] = await request.json() if not raw_body else __import__("json").loads(raw_body)
 
-    external_order_id = str(payload.get("id", ""))
-    customer = payload.get("customer", {})
-    customer_email = customer.get("email", payload.get("email", ""))
-    total_amount = float(payload.get("total_price", 0.0))
-
-    # Parse created_at timestamp
-    created_at_str = payload.get("created_at", "")
     try:
-        ordered_at = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
-    except Exception:
-        ordered_at = datetime.now(timezone.utc)
+        order_record = build_shopify_order_record(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if not external_order_id:
-        raise HTTPException(status_code=400, detail="Missing order id in payload")
+    external_order_id = order_record.external_order_id
 
     # 3. Write to Neon
     try:
-        order_id = _write_order_to_neon(
-            external_order_id=external_order_id,
-            platform="Shopify",
-            customer_email=customer_email,
-            total_amount=total_amount,
-            ordered_at=ordered_at,
-        )
+        order_id = _write_order_to_neon(order_record)
     except Exception as e:
         error_msg = str(e)
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
@@ -353,9 +311,13 @@ async def shopify_order_created(
         logger.warning(f"inventory_logs write failed (non-fatal): {e}")
 
     logger.info(
-        f"Shopify order {external_order_id} processed — "
-        f"Neon order_id={order_id}, amount=${total_amount:.2f}, "
-        f"shop={x_shopify_shop_domain}"
+        "Shopify order %s processed — Neon order_id=%s, %s %s locked to AUD %s, shop=%s",
+        external_order_id,
+        order_id,
+        order_record.currency_code,
+        order_record.gross_amount_foreign,
+        order_record.gross_amount_aud_locked,
+        x_shopify_shop_domain,
     )
 
     return {
@@ -363,6 +325,9 @@ async def shopify_order_created(
         "platform": "Shopify",
         "external_order_id": external_order_id,
         "neon_order_id": order_id,
+        "currency_code": order_record.currency_code,
+        "gross_amount_aud_locked": str(order_record.gross_amount_aud_locked),
+        "gst_reserve_aud": str(order_record.gst_reserve_aud),
     }
 
 
@@ -393,33 +358,16 @@ async def etsy_order_created(
     # 2. Parse payload
     payload: Dict[str, Any] = __import__("json").loads(raw_body)
 
-    # Etsy receipt structure
-    receipt = payload.get("receipt", payload)  # Some versions nest under "receipt"
-    external_order_id = str(receipt.get("receipt_id", receipt.get("id", "")))
-    customer_email = receipt.get("buyer_email", receipt.get("email", ""))
-    total_amount = float(receipt.get("grandtotal", {}).get("amount", 0)) / 100  # Etsy uses cents
-    if total_amount == 0:
-        # Try alternative field
-        total_amount = float(receipt.get("total_price", 0.0))
-
-    created_timestamp = receipt.get("create_timestamp", receipt.get("created_timestamp", 0))
     try:
-        ordered_at = datetime.fromtimestamp(int(created_timestamp), tz=timezone.utc)
-    except Exception:
-        ordered_at = datetime.now(timezone.utc)
+        order_record = build_etsy_order_record(payload)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
-    if not external_order_id:
-        raise HTTPException(status_code=400, detail="Missing receipt_id in payload")
+    external_order_id = order_record.external_order_id
 
     # 3. Write to Neon
     try:
-        order_id = _write_order_to_neon(
-            external_order_id=external_order_id,
-            platform="Etsy",
-            customer_email=customer_email,
-            total_amount=total_amount,
-            ordered_at=ordered_at,
-        )
+        order_id = _write_order_to_neon(order_record)
     except Exception as e:
         error_msg = str(e)
         if "unique" in error_msg.lower() or "duplicate" in error_msg.lower():
@@ -440,8 +388,12 @@ async def etsy_order_created(
         logger.warning(f"inventory_logs write failed (non-fatal): {e}")
 
     logger.info(
-        f"Etsy order {external_order_id} processed — "
-        f"Neon order_id={order_id}, amount=${total_amount:.2f}"
+        "Etsy order %s processed — Neon order_id=%s, %s %s locked to AUD %s",
+        external_order_id,
+        order_id,
+        order_record.currency_code,
+        order_record.gross_amount_foreign,
+        order_record.gross_amount_aud_locked,
     )
 
     return {
@@ -449,6 +401,9 @@ async def etsy_order_created(
         "platform": "Etsy",
         "external_order_id": external_order_id,
         "neon_order_id": order_id,
+        "currency_code": order_record.currency_code,
+        "gross_amount_aud_locked": str(order_record.gross_amount_aud_locked),
+        "gst_reserve_aud": str(order_record.gst_reserve_aud),
     }
 
 
