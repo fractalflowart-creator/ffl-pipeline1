@@ -8,11 +8,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Any, Dict
+from urllib import error as urllib_error, request as urllib_request
 
 from fastapi import APIRouter, Header, HTTPException, Request
 from sqlalchemy import text
 
-from credentials import _get_secret, get_sqlalchemy_engine
+from credentials import _get_secret, get_shopify_webhook_secret, get_sqlalchemy_engine
 
 logger = logging.getLogger("ffl.pipeline1.taske")
 router = APIRouter()
@@ -398,6 +399,64 @@ def verify_internal_key(authorization: str | None) -> bool:
         return False
 
 
+def _serialize_value(value: Any) -> Any:
+    if isinstance(value, Decimal):
+        return str(value)
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
+def _serialize_row(row: Dict[str, Any] | None) -> Dict[str, Any] | None:
+    if row is None:
+        return None
+    return {key: _serialize_value(value) for key, value in row.items()}
+
+
+def _dispatch_owner_alert(
+    *,
+    event_type: str,
+    title: str,
+    message: str,
+    severity: str,
+    metadata: Dict[str, Any] | None = None,
+) -> bool:
+    webhook_url = os.environ.get("OWNER_DASHBOARD_ALERT_WEBHOOK_URL", "").strip()
+    webhook_secret = os.environ.get("OWNER_DASHBOARD_ALERT_WEBHOOK_SECRET", "").strip()
+    if not webhook_url or not webhook_secret:
+        return False
+
+    payload = {
+        "event_type": event_type,
+        "title": title,
+        "message": message,
+        "severity": severity,
+        "metadata": metadata or {},
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    request_obj = urllib_request.Request(
+        webhook_url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "X-Owner-Dashboard-Alert-Secret": webhook_secret,
+        },
+        method="POST",
+    )
+    try:
+        with urllib_request.urlopen(request_obj, timeout=5) as response:
+            if 200 <= response.status < 300:
+                return True
+            logger.warning("Owner dashboard alert webhook returned HTTP %s", response.status)
+            return False
+    except urllib_error.HTTPError as exc:
+        logger.warning("Owner dashboard alert webhook failed: HTTP %s", exc.code)
+        return False
+    except Exception as exc:
+        logger.warning("Owner dashboard alert webhook error: %s", exc)
+        return False
+
+
 def _request_approval(
     *,
     entity_type: str,
@@ -406,6 +465,7 @@ def _request_approval(
     reason: str,
     risk_level: str,
     requested_by_agent: str,
+    emit_owner_alert: bool = True,
 ) -> Dict[str, Any]:
     normalized_risk = str(risk_level).strip().lower()
     if normalized_risk not in APPROVAL_RISK_LEVELS:
@@ -459,7 +519,8 @@ def _request_approval(
                     :requested_by_agent,
                     'pending'
                 )
-                RETURNING approval_id, status
+                RETURNING approval_id, entity_type, entity_id, approval_type, reason, risk_level,
+                          requested_by_agent, status, requested_at, resolved_at, owner_note
                 """
             ),
             {
@@ -472,18 +533,31 @@ def _request_approval(
             },
         ).mappings().first()
 
-        logger.info(
-            "Approval requested — approval_id=%s, entity=%s:%s, type=%s",
-            inserted["approval_id"],
-            entity_type,
-            entity_id,
-            approval_type,
+    logger.info(
+        "Approval requested — approval_id=%s, entity=%s:%s, type=%s",
+        inserted["approval_id"],
+        entity_type,
+        entity_id,
+        approval_type,
+    )
+
+    if emit_owner_alert and normalized_risk in {"high", "critical"}:
+        _dispatch_owner_alert(
+            event_type="approval_queue.high_risk",
+            title=f"{normalized_risk.title()} approval required",
+            message=f"Approval {inserted['approval_id']} for {entity_type}:{entity_id} is awaiting owner action.",
+            severity=normalized_risk,
+            metadata={
+                "approval_id": inserted["approval_id"],
+                "entity_type": entity_type,
+                "entity_id": entity_id,
+                "approval_type": approval_type,
+            },
         )
-        return {
-            "approval_id": inserted["approval_id"],
-            "status": inserted["status"],
-            "deduplicated": False,
-        }
+
+    serialized = _serialize_row(dict(inserted)) or {}
+    serialized["deduplicated"] = False
+    return serialized
 
 
 def _check_approval(entity_type: str, entity_id: str, approval_type: str) -> Dict[str, Any]:
@@ -618,6 +692,7 @@ def _open_order_exception(
             reason=f"High-severity order exception '{exception_type}' requires governed resolution.",
             risk_level=normalized_severity,
             requested_by_agent="Pipeline 1",
+            emit_owner_alert=False,
         )
 
     logger.info(
@@ -627,6 +702,21 @@ def _open_order_exception(
         exception_type,
         normalized_severity,
     )
+
+    if normalized_severity in {"high", "critical"}:
+        _dispatch_owner_alert(
+            event_type="order_exceptions.high_risk",
+            title=f"{normalized_severity.title()} order exception opened",
+            message=f"Exception {inserted['exception_id']} for order {order_id} requires owner attention.",
+            severity=normalized_severity,
+            metadata={
+                "exception_id": inserted["exception_id"],
+                "order_id": order_id,
+                "platform": platform,
+                "exception_type": exception_type,
+            },
+        )
+
     return {
         "exception_id": inserted["exception_id"],
         "resolution_status": inserted["resolution_status"],
@@ -767,6 +857,224 @@ def _update_order_finance_enrichment(
         "payment_fee_aud": str(updated["payment_fee_aud"]) if updated["payment_fee_aud"] is not None else None,
         "printful_cost_aud": str(updated["printful_cost_aud"]) if updated["printful_cost_aud"] is not None else None,
         "net_profit_aud_estimate": str(updated["net_profit_aud_estimate"]) if updated["net_profit_aud_estimate"] is not None else None,
+    }
+
+
+def _resolve_approval_item(*, approval_id: int, decision: str, owner_note: str | None = None) -> Dict[str, Any]:
+    normalized_decision = str(decision).strip().lower()
+    if normalized_decision not in {"approved", "rejected"}:
+        raise ValueError("decision must be either approved or rejected")
+
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        current = conn.execute(
+            text(
+                """
+                SELECT approval_id, entity_type, entity_id, approval_type, reason, risk_level,
+                       requested_by_agent, status, requested_at, resolved_at, owner_note
+                FROM approval_queue
+                WHERE approval_id = :approval_id
+                """
+            ),
+            {"approval_id": approval_id},
+        ).mappings().first()
+        if not current:
+            raise ValueError(f"No approval_queue row found for approval_id={approval_id}")
+
+        if current["status"] not in {"pending", "revision_requested", normalized_decision}:
+            raise ValueError(
+                f"Approval {approval_id} is already finalised with status '{current['status']}' and cannot be changed here"
+            )
+
+        if current["status"] == normalized_decision and current["resolved_at"] is not None:
+            return _serialize_row(dict(current)) or {}
+
+        updated = conn.execute(
+            text(
+                """
+                UPDATE approval_queue
+                SET status = :decision,
+                    resolved_at = NOW(),
+                    owner_note = CASE
+                        WHEN :owner_note IS NULL OR :owner_note = '' THEN owner_note
+                        ELSE :owner_note
+                    END
+                WHERE approval_id = :approval_id
+                RETURNING approval_id, entity_type, entity_id, approval_type, reason, risk_level,
+                          requested_by_agent, status, requested_at, resolved_at, owner_note
+                """
+            ),
+            {
+                "approval_id": approval_id,
+                "decision": normalized_decision,
+                "owner_note": owner_note,
+            },
+        ).mappings().first()
+
+    logger.info("Approval resolved — approval_id=%s, decision=%s", approval_id, normalized_decision)
+    return _serialize_row(dict(updated)) or {}
+
+
+def _list_pending_approval_items(limit: int = 100) -> list[Dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 250))
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT approval_id, entity_type, entity_id, approval_type, reason, risk_level,
+                       requested_by_agent, status, requested_at, resolved_at, owner_note
+                FROM approval_queue
+                WHERE status = 'pending'
+                ORDER BY CASE risk_level
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                END,
+                requested_at DESC,
+                approval_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": normalized_limit},
+        ).mappings().all()
+    return [_serialize_row(dict(row)) or {} for row in rows]
+
+
+def _list_open_order_exception_items(limit: int = 100) -> list[Dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 250))
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT e.exception_id, e.order_id, o.external_order_id, o.ordered_at, e.platform,
+                       e.exception_type, e.severity, e.customer_notification_status,
+                       e.owner_notified_at, e.resolution_status, e.resolution_note
+                FROM order_exceptions e
+                JOIN orders o ON o.order_id = e.order_id
+                WHERE e.resolution_status <> 'resolved'
+                ORDER BY CASE e.severity
+                    WHEN 'critical' THEN 1
+                    WHEN 'high' THEN 2
+                    WHEN 'medium' THEN 3
+                    ELSE 4
+                END,
+                e.exception_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": normalized_limit},
+        ).mappings().all()
+    return [_serialize_row(dict(row)) or {} for row in rows]
+
+
+def _get_finance_summary() -> Dict[str, Any]:
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) AS total_order_count,
+                       COALESCE(SUM(gross_amount_aud_locked), 0) AS gross_amount_aud_locked,
+                       COALESCE(SUM(gst_reserve_aud), 0) AS gst_reserve_aud,
+                       COALESCE(SUM(platform_fee_aud), 0) AS platform_fee_aud,
+                       COALESCE(SUM(net_profit_aud_estimate), 0) AS estimated_net_profit_aud
+                FROM orders
+                """
+            )
+        ).mappings().first()
+    return _serialize_row(dict(row)) or {}
+
+
+def _get_recent_shopify_orders(limit: int = 25) -> list[Dict[str, Any]]:
+    normalized_limit = max(1, min(int(limit), 100))
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                """
+                SELECT order_id, external_order_id, gross_amount_aud_locked, gst_reserve_aud,
+                       status, ordered_at, currency_code, platform
+                FROM orders
+                WHERE platform = 'Shopify'
+                ORDER BY ordered_at DESC NULLS LAST, order_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": normalized_limit},
+        ).mappings().all()
+    return [_serialize_row(dict(row)) or {} for row in rows]
+
+
+def _get_dashboard_overview(recent_window_hours: int = 24) -> Dict[str, Any]:
+    normalized_window = max(1, min(int(recent_window_hours), 168))
+    engine = get_sqlalchemy_engine()
+    with engine.begin() as conn:
+        order_metrics = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) FILTER (
+                           WHERE platform = 'Shopify'
+                             AND ordered_at >= NOW() - (:recent_window_hours * INTERVAL '1 hour')
+                       ) AS recent_shopify_order_count,
+                       COUNT(*) FILTER (WHERE platform = 'Shopify') AS total_shopify_order_count
+                FROM orders
+                """
+            ),
+            {"recent_window_hours": normalized_window},
+        ).mappings().first()
+        approval_metrics = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) AS pending_approval_count,
+                       COUNT(*) FILTER (WHERE risk_level IN ('high', 'critical')) AS urgent_pending_approval_count
+                FROM approval_queue
+                WHERE status = 'pending'
+                """
+            )
+        ).mappings().first()
+        exception_metrics = conn.execute(
+            text(
+                """
+                SELECT COUNT(*) AS open_exception_count,
+                       COUNT(*) FILTER (WHERE severity IN ('high', 'critical')) AS urgent_open_exception_count
+                FROM order_exceptions
+                WHERE resolution_status <> 'resolved'
+                """
+            )
+        ).mappings().first()
+
+    try:
+        shopify_secret_present = bool(get_shopify_webhook_secret())
+    except Exception:
+        shopify_secret_present = False
+
+    gst_mode = os.environ.get("FFL_GST_MODE", "").strip().lower()
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "pipeline_status": "ok",
+        "shopify_webhook_health": "healthy" if shopify_secret_present else "misconfigured",
+        "recent_window_hours": normalized_window,
+        "recent_shopify_order_count": int(order_metrics["recent_shopify_order_count"] or 0),
+        "total_shopify_order_count": int(order_metrics["total_shopify_order_count"] or 0),
+        "pending_approval_count": int(approval_metrics["pending_approval_count"] or 0),
+        "urgent_pending_approval_count": int(approval_metrics["urgent_pending_approval_count"] or 0),
+        "open_exception_count": int(exception_metrics["open_exception_count"] or 0),
+        "urgent_open_exception_count": int(exception_metrics["urgent_open_exception_count"] or 0),
+        "gst_mode": gst_mode or None,
+        "gst_alert_active": gst_mode != "inclusive",
+        "fx_policy": {
+            "primary": "platform-native AUD mirror",
+            "secondary": "internal controlled fallback",
+        },
+        "go_live_checklist": {
+            "Shopify live": "live",
+            "Etsy deferred": "deferred",
+            "GST mode": "inclusive" if gst_mode == "inclusive" else f"drift:{gst_mode or 'unset'}",
+            "FX policy": "platform-native AUD mirror primary; internal controlled fallback secondary",
+        },
     }
 
 
@@ -938,3 +1246,141 @@ async def update_order_finance_enrichment(
     except Exception as exc:
         logger.error("Order finance enrichment update failed: %s", exc)
         raise HTTPException(status_code=500, detail=f"Order finance enrichment update failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/overview")
+async def dashboard_overview(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/overview request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        result = _get_dashboard_overview(int(body.get("recent_window_hours", 24)))
+        return {"status": "ok", **result}
+    except Exception as exc:
+        logger.error("Dashboard overview failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard overview failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/approval_queue")
+async def dashboard_approval_queue(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/approval_queue request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        items = _list_pending_approval_items(int(body.get("limit", 100)))
+        return {"status": "ok", "items": items, "count": len(items)}
+    except Exception as exc:
+        logger.error("Dashboard approval queue read failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard approval queue read failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/approval_queue/resolve")
+async def dashboard_resolve_approval(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/approval_queue/resolve request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    if "approval_id" not in body:
+        raise HTTPException(status_code=400, detail="Missing required field: approval_id")
+    if "decision" not in body:
+        raise HTTPException(status_code=400, detail="Missing required field: decision")
+
+    try:
+        result = _resolve_approval_item(
+            approval_id=int(body["approval_id"]),
+            decision=str(body["decision"]),
+            owner_note=body.get("owner_note"),
+        )
+        return {"status": "ok", **result}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Dashboard approval resolve failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard approval resolve failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/order_exceptions")
+async def dashboard_order_exceptions(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/order_exceptions request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        items = _list_open_order_exception_items(int(body.get("limit", 100)))
+        return {"status": "ok", "items": items, "count": len(items)}
+    except Exception as exc:
+        logger.error("Dashboard order exceptions read failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard order exceptions read failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/finance/summary")
+async def dashboard_finance_summary(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/finance/summary request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        result = _get_finance_summary()
+        return {"status": "ok", **result}
+    except Exception as exc:
+        logger.error("Dashboard finance summary failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard finance summary failed: {exc}") from exc
+
+
+@router.post("/internal/dashboard/orders/recent")
+async def dashboard_recent_orders(
+    request: Request,
+    authorization: str = Header(None),
+):
+    if not verify_internal_key(authorization):
+        logger.warning("Unauthorised /internal/dashboard/orders/recent request")
+        raise HTTPException(status_code=401, detail="Unauthorised")
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+
+    try:
+        items = _get_recent_shopify_orders(int(body.get("limit", 25)))
+        return {"status": "ok", "items": items, "count": len(items)}
+    except Exception as exc:
+        logger.error("Dashboard recent orders failed: %s", exc)
+        raise HTTPException(status_code=500, detail=f"Dashboard recent orders failed: {exc}") from exc
